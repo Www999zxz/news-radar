@@ -9,6 +9,7 @@
   var curCat = 'all';
   var searchQ = '';
   var searchTokens = [];
+  var renderLimit = 200;        // 性能：一次最多渲染 200 条，点「加载更多」递增
   var pending = [];             // 已拉取但未展示的新消息
   var keywords = [];            // 自选关键词
   var soundOn = true;
@@ -369,7 +370,8 @@
   }
 
   function render() {
-    var arr = visibleItems();
+    var filtered = visibleItems();
+    var arr = filtered.slice(0, renderLimit);
     var html = '';
     var lastDay = '';
     for (var i = 0; i < arr.length; i++) {
@@ -380,6 +382,10 @@
       }
       html += cardHtml(arr[i]);
     }
+    if (filtered.length > renderLimit) {
+      html += '<div class="day-divider load-more-wrap"><button id="loadMoreBtn" class="load-more-btn">' +
+        '↓ 加载更多（还有 ' + (filtered.length - renderLimit) + ' 条）</button></div>';
+    }
     listEl.innerHTML = html;
     $('empty').style.display = arr.length ? 'none' : 'block';
     if ($('empty')) {
@@ -389,7 +395,7 @@
     if (cnt) {
       if (searchTokens.length) {
         cnt.style.display = 'inline';
-        cnt.textContent = '命中 ' + arr.length + ' 条';
+        cnt.textContent = '命中 ' + filtered.length + ' 条';
       } else {
         cnt.style.display = 'none';
       }
@@ -397,8 +403,14 @@
     autoTranslateRun();
   }
 
-  /* 翻译按钮点击（事件委托） */
+  /* 翻译按钮 / 加载更多（事件委托） */
   listEl.addEventListener('click', function (e) {
+    var more = e.target.closest ? e.target.closest('#loadMoreBtn') : null;
+    if (more) {
+      renderLimit += 200;
+      render();
+      return;
+    }
     var btn = e.target.closest ? e.target.closest('.tr-btn') : null;
     if (btn && btn.getAttribute) {
       var id = btn.getAttribute('data-tr');
@@ -409,8 +421,7 @@
         return;
       }
     }
-    var sBtn = e.target.closest ? e.target.closest('.sent-btn') : null;
-    if (sBtn && sBtn.getAttribute) {
+    var sBtn = e.target.closest ? e.target.closest('.sent-btn') : null;    if (sBtn && sBtn.getAttribute) {
       var sid = sBtn.getAttribute('data-sent');
       if (sid) {
         for (var j = 0; j < allItems.length; j++) {
@@ -686,6 +697,7 @@
       document.querySelectorAll('.tab').forEach(function (x) { x.classList.remove('active'); });
       t.classList.add('active');
       curCat = t.getAttribute('data-cat');
+      renderLimit = 200;   // 切分类重置渲染上限
       // 切换分类时把缓冲也并进来，避免漏看
       prependPending();
       render();
@@ -700,6 +712,7 @@
   function applySearch() {
     searchQ = $('searchInput').value || '';
     searchTokens = parseSearch(searchQ);
+    renderLimit = 200;   // 新搜索重置渲染上限
     $('searchClear').style.display = searchQ ? 'flex' : 'none';
     render();
   }

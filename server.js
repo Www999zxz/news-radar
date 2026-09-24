@@ -93,11 +93,52 @@ function addItem(o) {
     cats: classify(o.text), important: RE_URGENT.test(o.text),
     impacts: detectImpacts(o.text)
   });
+  markDirty();
   return true;
 }
 function sortTrim() {
   items.sort((a, b) => b.ts - a.ts);
   if (items.length > 500) items.length = 500;
+}
+
+/* ---------- 数据落地（重启不丢：快讯 + 行情历史，零依赖 JSON 存储） ---------- */
+const DATA_FILE = path.join(__dirname, 'data.json');
+let dataDirty = false;
+function markDirty() { dataDirty = true; }
+function saveState() {
+  try {
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    const mh = {};
+    for (const code of Object.keys(marketHistory)) {
+      mh[code] = marketHistory[code].filter(x => x.t > cutoff);
+      if (!mh[code].length) delete mh[code];
+    }
+    const payload = { seq, items: items.slice(0, 500), marketHistory: mh, savedAt: Date.now() };
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(payload));
+    fs.renameSync(tmp, DATA_FILE);   // 原子替换，避免写一半损坏
+    dataDirty = false;
+  } catch (e) { console.error('[persist] save failed:', e.message); }
+}
+function loadState() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const j = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (Array.isArray(j.items) && j.items.length) {
+      items = j.items.filter(x => x && x.id && x.ts && x.text);
+      seq = j.seq || (items.reduce((m, x) => Math.max(m, x.seq || 0), 0));
+      sortTrim();
+      console.log('[persist] restored ' + items.length + ' items');
+    }
+    if (j.marketHistory && typeof j.marketHistory === 'object') {
+      const cutoff = Date.now() - 30 * 60 * 1000;
+      for (const code of Object.keys(j.marketHistory)) {
+        const h = (j.marketHistory[code] || []).filter(x => x && x.t > cutoff && isFinite(x.p));
+        if (h.length) marketHistory[code] = h;
+      }
+      console.log('[persist] restored market history');
+    }
+  } catch (e) { console.error('[persist] load failed:', e.message); }
 }
 
 /* ---------- 抓取器 ---------- */
@@ -406,6 +447,7 @@ async function fetchMarket() {
       for (const a of assets) {
         const h = marketHistory[a.code] = marketHistory[a.code] || [];
         h.push({ t: now, p: a.price });
+        markDirty();
         while (h.length && now - h[0].t > 30 * 60 * 1000) h.shift();
         const cut = h.find(x => now - x.t >= 5 * 60 * 1000);
         a.chg5 = cut ? Math.round((a.price - cut.p) / cut.p * 10000) / 100 : null;
@@ -428,6 +470,26 @@ async function fetchMarket() {
 
 /* ================= 翻译 ================= */
 const trCache = {};
+function trCachePut(q, val) {
+  trCache[q] = val;
+  // 缓存上限 300 条：超出时按插入顺序淘汰最早的
+  const keys = Object.keys(trCache);
+  for (let i = 0; i < keys.length - 300; i++) delete trCache[keys[i]];
+}
+/* 每 IP 简易限流：翻译 20 次/分钟，情绪打分类接口 10 次/分钟 */
+const rateMap = new Map();   // ip+bucket → [windowStart, count]
+function rateLimit(ip, bucket, maxPerMin) {
+  const now = Date.now();
+  const key = ip + '|' + bucket;
+  let e = rateMap.get(key);
+  if (!e || now - e[0] > 60000) { e = [now, 0]; rateMap.set(key, e); }
+  e[1]++;
+  // Map 防膨胀：超过 2000 个 key 清理过期项
+  if (rateMap.size > 2000) {
+    for (const [k, v] of rateMap) if (now - v[0] > 120000) rateMap.delete(k);
+  }
+  return e[1] <= maxPerMin;
+}
 async function translateText(q) {
   if (trCache[q]) return trCache[q];
   // 首选 Google gtx 免费接口
@@ -436,13 +498,13 @@ async function translateText(q) {
     const txt = await fetchText(url, null, 6000);
     const j = JSON.parse(txt);
     const trans = (j[0] || []).map(x => x[0]).join('').trim();
-    if (trans) { trCache[q] = trans; return trans; }
+    if (trans) { trCachePut(q, trans); return trans; }
   } catch (e) {}
   // 备选 MyMemory
   const url2 = 'https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=' + encodeURIComponent(q.slice(0, 400));
   const j2 = JSON.parse(await fetchText(url2, null, 6000));
   const trans2 = j2 && j2.responseData && j2.responseData.translatedText;
-  if (trans2) { trCache[q] = trans2; return trans2; }
+  if (trans2) { trCachePut(q, trans2); return trans2; }
   throw new Error('translate failed');
 }
 
@@ -518,6 +580,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/translate') {
+      if (!rateLimit(req.socket.remoteAddress || '?', 'tr', 20)) {
+        send(res, 429, JSON.stringify({ code: 1, msg: '请求太快，请稍后再试' }));
+        return;
+      }
       const q = u.searchParams.get('q') || '';
       try {
         const trans = await translateText(q);
@@ -526,6 +592,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === '/api/sentiment' && req.method === 'POST') {
+      if (!rateLimit(req.socket.remoteAddress || '?', 'sent', 10)) {
+        send(res, 429, JSON.stringify({ msg: '请求太快，请稍后再试' }));
+        return;
+      }
       send(res, 400, JSON.stringify({ msg: '重建版暂未接入 TypeSafe 情绪打分服务', needKey: true }));
       return;
     }
@@ -538,38 +608,6 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/jev-test' && req.method === 'POST') {
       send(res, 400, JSON.stringify({ msg: '重建版暂未接入 TypeSafe，情绪打分按钮将提示不可用' }));
-      return;
-    }
-
-    if (p === '/api/debug-wb') {
-      // 临时诊断：依次测试三条通道
-      const out = { tried: [], parsed: 0, sample: '' };
-      for (const idx of [2, 3, 4, 5, 6, 7]) {
-        try {
-          const xml = await fetchText(WB_ENDPOINTS[idx], null, 7000);
-          const list = parseNitterRss(xml);
-          out.tried.push({ url: WB_ENDPOINTS[idx], ok: true, bytes: xml.length, items: list.length });
-          if (list.length && !out.sample) { out.parsed = list.length; out.sample = xml.slice(0, 2500); }
-        } catch (e) { out.tried.push({ url: WB_ENDPOINTS[idx], ok: false, err: String(e && e.message || e).slice(0, 120) }); }
-      }
-      try {
-        for (const relayUrl of wbRelays().concat(['https://twitrss.me/twitter_user_to_rss/?user=DeItaone'])) {
-          try {
-            const payload = await fetchText(relayUrl, null, 12000);
-            const list2 = parseRelayPayload(payload);
-            out.tried.push({ url: relayUrl.slice(8, 60), ok: true, bytes: payload.length, items: list2.length });
-            if (!out.sample) out.sample = payload.slice(0, 1200);
-          } catch (e2) { out.tried.push({ url: relayUrl.slice(8, 60), ok: false, err: String(e2 && e2.message || e2).slice(0, 100) }); }
-          if (out.parsed) break;
-        }
-      } catch (e) {}
-      try {
-        const md = await fetchText('https://r.jina.ai/https://x.com/DeItaone', null, 15000);
-        const list3 = parseJinaMarkdown(md);
-        out.tried.push({ url: 'jina', ok: true, bytes: md.length, items: list3.length });
-        if (list3.length) { out.parsed = list3.length; out.sample = 'JINA-MD: ' + md.slice(0, 1500); }
-      } catch (e) { out.tried.push({ url: 'jina', ok: false, err: String(e && e.message || e).slice(0, 120) }); }
-      sendJson(res, out);
       return;
     }
 
@@ -589,10 +627,30 @@ const server = http.createServer(async (req, res) => {
 const SYNC_MS = 30000;   // 后端30秒抓取一轮
 const MARKET_MS = 20000; // 行情20秒一轮
 
+loadState();             // 启动时恢复上次的数据
 syncAll().catch(() => {});
 fetchMarket().catch(() => {});
 setInterval(() => syncAll().catch(() => {}), SYNC_MS);
 setInterval(() => fetchMarket().catch(() => {}), MARKET_MS);
+setInterval(() => { if (dataDirty) saveState(); }, 60000);  // 有变化时每分钟落盘
+
+/* ================= 崩溃兜底（进程不被单个异常打死） ================= */
+process.on('uncaughtException', (e) => {
+  console.error('[uncaught]', e && e.stack || e);
+  try { fs.appendFileSync(path.join(__dirname, 'error.log'),
+    new Date().toISOString() + ' UNCAUGHT: ' + (e && e.stack || e) + '\n'); } catch (_) {}
+});
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandledRejection]', e);
+  try { fs.appendFileSync(path.join(__dirname, 'error.log'),
+    new Date().toISOString() + ' REJECTION: ' + (e && (e.stack || e.message) || e) + '\n'); } catch (_) {}
+});
+function shutdown() {
+  try { saveState(); } catch (_) {}
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log('[news-radar] listening on port ' + PORT);
