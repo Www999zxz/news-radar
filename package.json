@@ -1,0 +1,13 @@
+{
+  "name": "news-radar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "全球快讯雷达 - PC重建版（含模糊搜索）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
